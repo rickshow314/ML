@@ -1,0 +1,1159 @@
+---
+title: "Tarea_Machine_Learning"
+author: "Ricardo_Urdiales_Muñoz"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    highlight: kate
+    number_sections: yes
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introducción
+
+Se trata de responder a las preguntas siguientes
+
+## Librerias
+
+```{r}
+library(dplyr)
+library(corrplot)
+library(caret)
+library(stats)
+library(gplots)
+library(ggplot2)
+library(gridExtra)
+library(reshape2)
+library(ranger)
+#install.packages("tensorflow")
+#tensorflow::install_tensorflow() con este código arreglamos la instalación local de keras, ya que surgen incompatibilidades con los paquetes tensorflow y keras.
+#install.packages("keras")
+library(tensorflow)
+library(keras)
+library(pROC)
+```
+
+Semilla del código
+
+```{r}
+#Usamos una semilla para mejorar la reproducibilidad del trabajo
+set.seed(123)
+
+```
+
+
+## Lectura de los ficheros
+```{r}
+datos_clinicos = read.csv("Main.csv")
+
+analisis_digital = read.delim("DigPathology.tsv", stringsAsFactors = F,sep="\t")
+
+sistema_inmune = read.delim("mutational-signatures.tsv",stringsAsFactors = F, sep="\t" )
+
+transcriptomica = read.delim("RNAseq-rawcounts.tsv",stringsAsFactors = F,sep="\t")
+```
+
+## Tratamiento de datos
+
+  Eliminación de la columnas y creacion de copias de los datasets
+
+```{r}
+datos_clinicos_copy <- data.frame(datos_clinicos)
+datos_clinicos_copy$X <- NULL
+
+analisis_digital_copy <- data.frame(analisis_digital)
+analisis_digital_copy$Trial.ID <- NULL
+
+sistema_inmune_copy <- data.frame(sistema_inmune)
+
+transcriptomica_copy <- data.frame(transcriptomica)
+```
+
+  Cambio del nombre de la columna X  en sistema_inmune por Trial.ID
+
+```{r}
+sistema_inmune_copy <- rename(sistema_inmune, Trial.ID = X)
+```
+
+  Eliminación de las columnas del dataset datos_clinicos cuyas variables resp.Chemoresistant, resp.Chemosensitive, RCB.score y RCB.category son redundantes con la primera, resp.PCR
+
+```{r}
+datos_clinicos_copy$resp.Chemosensitive <- NULL
+
+datos_clinicos_copy$resp.Chemoresistant <- NULL
+
+datos_clinicos_copy$RCB.score <- NULL
+
+datos_clinicos_copy$RCB.category <- NULL
+
+pacientes_comunes_clinicos_inmune <- intersect(datos_clinicos_copy$Trial.ID,sistema_inmune_copy$Trial.ID)
+
+sistema_inmune_copy_filt <- subset(sistema_inmune_copy, Trial.ID %in% pacientes_comunes_clinicos_inmune)
+
+datos_clinicos_copy_filt <- subset(datos_clinicos_copy, Trial.ID %in% pacientes_comunes_clinicos_inmune)
+
+pacientes_comunes_datos_analisis <- intersect(datos_clinicos_copy_filt$Trial.ID,analisis_digital$Trial.ID)
+
+analisis_digital_copy_filt <- subset(analisis_digital, Trial.ID %in% pacientes_comunes_datos_analisis)
+
+analisis_digital_copy_filt$Trial.ID <- NULL
+
+resp.pCr_original <- select(datos_clinicos_copy_filt, resp.pCR)
+
+resp.pCr_original$resp.pCR <- as.factor(resp.pCr_original$resp.pCR)
+
+sistema_inmune_copy_filt$Trial.ID <- NULL
+
+```
+
+Tratamiento del dataset Transcriptomica
+
+```{r}
+
+transcr = t(transcriptomica_copy)
+
+pacientes_trans <- intersect(rownames(transcr),unique(datos_clinicos_copy_filt$Trial.ID))
+
+#edicion de la tabla de transcriptomica para poner las columnas de una forma mas sencilla para su procesado
+w<-which(rownames(transcr) %in% pacientes_trans)
+transcrip_copy_filt <- transcr[w,]
+```
+
+
+
+# Análisis Exploratorio (2.5 puntos)
+
+## Pregunta (0.2 puntos)
+
+  En cada uno de los cuatro ficheros, ¿cuántos predictores hay? ¿Y cuántas muestras? ¿Qué identificador tiene la columna correspondiente al identificador de paciente? ¿Cuántos pacientes hay que tengan datos disponibles en los cuatro ficheros? 
+
+```{r}
+prueba_longitud <- c("datos_clinicos_copy$Trial.ID", "analisis_digital$Trial.ID", 
+             "sistema_inmune_copy$Trial.ID", "transcrip_copy_filt")
+
+for (i in prueba_longitud) {
+  cat("La longitud de", i, "es:", length(eval(parse(text = i))), "\n")
+}
+
+```
+-En el fichero de analisis_digital tenemos 7 predictores, 166 muestras ,el identificador de la columna es Trial.ID
+
+-En el fichero datos_clinicos_copy tenemos 69 predictores, 147 muestras ,el identificador de la columna es Trial.ID
+
+-En el fichero sistema_inmune tenemos 32 predictores, 163 muestras ,el identificador de la columna es X
+
+-En el fichero de transcriptomica tenemos 8280415 predictores, 163 muestras ,el identificador de la columna es X
+
+
+Trial.id,145(juntar las dos tablas y ver que me quite el resto)
+```{r}
+pacientes_comunes<-intersect(unique(analisis_digital$Trial.ID), unique(datos_clinicos_copy$Trial.ID))
+
+pacientes_comunes2<-intersect(unique(sistema_inmune_copy$Trial.ID), unique(colnames(transcriptomica)))
+
+pacientes_fin<-intersect(pacientes_comunes,pacientes_comunes2)
+
+length(pacientes_fin)
+
+```
+Siendo 143 el número de pacientes comunes a los cuatro ficheros de datos.
+
+## Pregunta (0.2 puntos)
+
+### ¿Hay valores nulos en alguno de los ficheros? 
+
+Vamos a comprobar si tenemos valores nulos en los diferentes ficheros:
+
+```{r}
+val_nulos <- list(analisis_digital, datos_clinicos_copy, sistema_inmune_copy, transcriptomica)
+
+for (i in seq_along(val_nulos)) {
+  # Filtrar las filas con valores perdidos
+  filtro <- val_nulos[[i]][rowSums(is.na(val_nulos[[i]])) > 0, ]
+  # Calcular el número de valores nulos por columna
+  num_valores_nulos <- colSums(is.na(filtro))
+  # Calcular el número total de valores nulos
+  total_valores_nulos <- sum(num_valores_nulos)
+  # Imprimir el resultado
+  cat("El número total de valores nulos en el dataframe", i, "es:", total_valores_nulos, "\n")
+}
+```
+Siendo analisis el 1, datos clinicos el 2, sistema inmune el 3 y transcriptomica el 4.
+
+Filtrando los diferentes datasets de valores nulos y comprobamos que se mantiene la misma cantidad de datos,por lo que no tenemos valores nulos en los ficheros.
+
+En el caso de tenerlos evaluariamos que método debería ser el mejor a tratar, solo hemos filtrado para comprobar su existencia. 
+
+### ¿Cómo los tratarías?
+
+Tenemos diferentes opciones:
+
+* **Podemos eliminarlos(filtrarlos):** esto debería ser lo último que debieramos hacer ya que podemos perder información. Si el dataset es grande es más plausible realizar esto que si tenemos pocos datos. Si tenemos pocos valores nulos puede merecer la pena dejarlos a eliminarlos.
+
+* **Mantener esos valores nulos:** En algunos casos, los valores nulos pueden ser información importante y deben ser mantenidos como tales. Por ejemplo, si se están comparando dos grupos y uno de ellos tiene una tasa alta de valores nulos en una variable, esto puede ser una información valiosa que no debe ser ignorada.
+
+* **Imputar esos valores:** Usar el valor medio, de todos los valores de los atributos o sólo de los que pertencen a la misma clase, usar el valor más probable o predecir el valor mediante alguna técnica predictiva como la clasificación o regresión.
+
+## Pregunta (0.2 puntos)
+
+Describe, para cada fichero, el número de variables numéricas (ya sean enteras o reales) y el número de variables factor (categóricas) sin enumerarlas.
+
+### Diferentes tipos de variables:
+
+* **Variables numéricas:** Las variables numéricas, que son aquellas que representan números y con ellas se pueden realizar operaciones aritméticas
+
+* **Variables categóricas:** Las variables categóricas pueden ser variables de cadena (alfanuméricas) o variables numéricas que utilizan códigos numéricos para representar a categorías
+
+
+Fichero sistema_inmune
+
+```{r}
+variables_numericas <- sapply(sistema_inmune, is.numeric)
+sum(variables_numericas)
+```
+El fichero sistema_inmune no posee variables categóricas.
+
+Variables numéricas de analisis digital
+```{r}
+variables_numericas_analisis <- sapply(analisis_digital, is.numeric)
+sum(variables_numericas_analisis)
+```
+
+El fichero analisis_digital no tiene variables categóicas.
+
+Variables numéricas de datos_clinicos
+```{r}
+variables_numericas_clinicos <- sapply(datos_clinicos_copy, is.numeric)
+sum(variables_numericas_clinicos)
+```
+
+El fichero datos_clinicos tiene variables categóricas diferentes, algunas de las cuales varían entre valores como 0 y 1, otras entre -1 y 1 o casos como el de "Grade.pre.chemotherapy" que cambian entre 2 o 3. Las tomamos como categóricas ya que esos valores van asociados a un significado y no a un valor numérico.
+
+Variables númericas de transcriptomica
+```{r}
+variables_numericas_transcriptomica <- sapply(transcriptomica, is.numeric)
+sum(variables_numericas_transcriptomica)
+```
+
+El fichero transcriptomica no tiene variables categóricas.
+
+
+## Pregunta (0.2 puntos)
+
+¿Están normalizadas las variables en cada uno de los cuatro ficheros? En este punto del análisis, ¿es necesario normalizarlas?
+
+Ahora mismo no lo puedo saber, deberé normalizar según cuál sea el objetivo del ejercicio. No puedo normalizar estos datos por que hay variables que se diferencia entre si, según que fichero tiene variables categóricas junto con variables numéricas por lo que diría que no. Normalizaré según lo que requiera la situación.
+
+
+## Pregunta (0.2 puntos)
+
+Las variables importantes son, sobre todo, las que nos dan información sobre la respuesta al tratamiento, a saber `resp.pCR`, `resp.Chemoresistant`, `resp.Chemosensitive`, `RCB.score` y `RCB.category`. Descríbelas según la información que aparece en el paper y descríbelas según su tipo. Si son numéricas, usa whisker plots o histogramas para representarlas y coméntalas. Si son categóricas, proporciona información sobre la distribución de sus valores.
+
+
+- **resp.PCR:**
+
+Esto no indica que los tumores que alcanzaron un valor positivo de pCR procedían en su mayoría a clases tumorales más agresivos, los cuales tenían una mayor carga de mutaciones tumorales y de neoantígenos.Dependiendo del valor de pCR los canceres de mama se asocian a un tipo de genes u otros, relacionandolo también con la enfermedad residual.
+
+```{r}
+positivos_pCR <- mean(datos_clinicos$resp.pCR)
+negativos_pCR <- 1 - positivos_pCR
+porcentaje_positivos_pCR <- round(positivos_pCR * 100, 1)
+porcentaje_negativos_pCR <- round(negativos_pCR * 100, 1)
+pie(c(positivos_pCR, negativos_pCR),
+    labels = c(paste("Valores altos de pCR",",", porcentaje_positivos_pCR, "%"),
+               paste("Valores bajos de pCR",",", porcentaje_negativos_pCR, "%")),
+    main = "Estudio en pacientes de pCR",
+    col = c("#66c2a5", "#fc8d62"),
+    border = "white",
+    cex = 0.8)
+legend("top", c("Valores altos", "Valores bajos"), fill = c("#66c2a5", "#fc8d62"), border = NA, horiz = TRUE, x.intersp = 0.2, y.intersp = 0.1, cex = 0.8)
+```
+**Fig.1**
+**Fig.1**Esta gráfica nos indica el porcentaje de pacientes que muestran un valor alto o bajo de pCR.
+
+Tenemos dos tipos de pacientes, los que alcanzan la pCR y los que no. Los tumores que alcanzaron pCR presentaban en su mayoría una alta proliferación y una alta activación inmunitaria, ambas firmas disminuían de forma escalonada a medida que aumentaba el grado de enfermedad residual. En general, los tumores que alcanzan pCR tienden a ser muy proliferativos y muestran indicios de una TiME activa.
+
+- **resp.Chemoresistant:**
+
+Aquí nos dice que tumores son resistentes a tratamientos tipicos, es decir, su pronóstico es malo si se tratan con terapias estándar.Por lo que diferencia entre resistentes o no.
+
+```{r}
+positivos_chemore <- mean(datos_clinicos$resp.Chemoresistant)
+negativos_chemore <- 1 - positivos_chemore
+porcentaje_positivos_chemore <- round(positivos_chemore * 100, 1)
+porcentaje_negativos_chemore <- round(negativos_chemore * 100, 1)
+pie(c(positivos_chemore, negativos_chemore),
+    labels = c(paste("Pacientes con resistencias",",", porcentaje_positivos_chemore, "%"),
+               paste("Pacientes sin resistencias",",", porcentaje_negativos_chemore, "%")), main = "Pacientes con resistencias a la Quimioterapia",
+    col = c("#FDEBD0", "#D4EFDF"),
+    border = "black",
+    cex = 0.8)
+legend("top", c("Resistentes", "No resistentes"), fill = c("#FDEBD0", "#D4EFDF"), border = NA, horiz = TRUE, x.intersp = 0.2, y.intersp = 0.1, cex = 0.8)
+    
+```
+**Fig.2**
+**Fig.2**Gráfico que representa el porcentaje de pacientes que presentan resistencias a la quimioterapia.
+
+
+- **resp.Chemosensitive:**
+
+Se refiere a una sensibilidad al tratamiento de Quimioterapia.
+
+```{r}
+positivos_chemosen <- mean(datos_clinicos$resp.Chemoresistant)
+negativos_chemosen <- 1 - positivos_chemosen
+porcentaje_positivos_chemosen <- round(positivos_chemosen * 100, 1)
+porcentaje_negativos_chemosen <- round(negativos_chemosen * 100, 1)
+pie(c(positivos_chemosen, negativos_chemosen),
+    labels = c(paste("Pacientes con sensibilidad",",", porcentaje_positivos_chemosen, "%"),
+               paste("Pacientes sin sensibilidad",",", porcentaje_negativos_chemosen, "%")), main = "Pacientes sensibles a la Quimioterapia",
+    col = c("#F5D0C5", "#C5E1A5"),
+    border = "black",
+    cex = 0.8)
+legend("top", c("Sensibles", "No sensibles"), fill = c("#F5D0C5", "#C5E1A5"), border = NA, horiz = TRUE, x.intersp = 0.2, y.intersp = 0.1, cex = 0.8)
+```
+**Fig.3**
+**Fig.3**Esta gráfica nos muestra el porcentaje existente de pacientes que muestran sensibilidad al tratamiento y pacientes que no lo son.
+
+- **RCB.score:**
+
+RCB score se refiere a la carga de cáncer residual, la cuál fue comprobada antes de someter a tratmiento a los diferentes pacientes.
+Dependiendo del tipo de valor de pCR se tendrá un valor de RCB diferente.Hay tres clases de RCB:1,2 y 3.
+
+```{r}
+boxplot(datos_clinicos$RCB.score, main="Puntuación de RCB ",
+        col="light green", border="black", lty = "dashed", whisklty = "dotted")
+```
+**Fig.4** 
+
+**Fig.4**Esta representación nos está indicando que la puntuación más frecuente se encuentra entre 1 y 2. Encontrando casos atipicos que superan los valores de 3 llegando hasta valores superiores a 4. Casos muy poco frecuentes pero no llegan a ser atípicos.
+
+- **RCB.category:**
+Desde el tipo 1 al 3, nos indica la cantidad de carga que tiene el cáncer, siendo el tipo 1 la que menos carga tiene y siendo el tipo 3 indica que hay una carga sustancial de cáncer invasivo residual, y la probabilidad de recurrencia es alta.
+
+```{r}
+boxplot(datos_clinicos$RCB.category, main="Categoría de valores RCB ",
+col="light blue", border="black", lty = "dashed", whisklty = "dotted")
+```
+**Fig.5** 
+**Fig.5**En esta representación vemos que los valores de categoría van desde el 0 al 3, teniendo la media en categoría 2 y siendo los casos de categoría 3 muy raros. Categoría 0 nos quiere decir que el nivel de RCB en el paciente es mínimo mientras que en los del caso 3,tienen un elevado número de residuos.
+
+Con todo esto podemos ver que la variable más importante de estas 4 es la relacionada con la de pCR ya que el resto no nos da información sustancial.
+
+## Pregunta (0.5 puntos)
+
+Mediante el uso de un plot del tipo `corrplot` analiza las posibles correlaciones entre las variables numéricas del fichero `Main.csv` y coméntalas.
+
+Estudio de la correlación del fichero datos_clinicos:
+
+Aqui tengo **variables categóricas**,debo quitarlas para poder realizar el estudio de las correlaciones.
+
+Además de quitar estas variables debemos escalar los datos ya que al estar en diferentes magnitudes no queremos que variables con mayor amplitud se lleven todo el dominio de la PCA.
+
+La escala de los datos es importante porque las varianzas de las variables pueden verse influidas por las diferencias en las escalas de las variables. Si las variables tienen diferentes escalas, las variables con valores más grandes pueden tener mayor influencia en la PCA que las variables con valores más pequeños. Al escalar los datos, se asegura que todas las variables tengan la misma escala y, por lo tanto, las varianzas reflejen la verdadera importancia relativa de las variables en los componentes principales.
+
+Tambien quitaremos valores con una alta correlación, haciendo esto perderemos información a cambio de hacer un mejor analisis de los datos y de los resultados.
+
+```{r}
+
+#Creación del subset
+dc_subset <- datos_clinicos_copy_filt[, -c(1,2,4:7,15:16,18,64:69)]
+
+#Escalado de las variables, si no escalo Pearson es tan robusto que me permite representarlo igual sin escalar
+scaled_dc_subset <- scale(dc_subset[,1:54],center = TRUE, scale = TRUE)
+
+#Calculo la matriz de correlación
+cor_matrix.dc.subset <- cor(scaled_dc_subset)
+
+#Eliminación variables altamente correlacionadas
+highly_correlated.dc.subset <- findCorrelation(cor_matrix.dc.subset, cutoff = 0.8)
+dc_subset <- scaled_dc_subset[, -highly_correlated.dc.subset]
+cor_matrix <- cor(dc_subset)
+
+#Gráfico de la matriz de correlación con corrplot
+corrplot(cor_matrix.dc.subset, method = "circle",tl.cex = 0.7, tl.col = "black")
+
+
+```
+**Fig.6**
+
+**Fig.6** El problema es que al tener tantas variables, no puedo distinguir bien los valores. Así que voy a probar con una heatmap.
+
+```{r}
+ggplot(data = melt(cor_matrix.dc.subset), aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limits = c(-1, 1), name = "Correlation") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(x = "", y = "") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  ggtitle("Heatmap de la matriz de correlación")
+```
+**Fig.7**
+
+**Fig.7** Ahora falta poder interpretarlo.En un heatmap, los valores altos se representan con colores más intensos, mientras que los valores bajos se representan con colores más suaves o incluso en blanco. Al elegir colores desde el azul,pasando por el blanco al rojo podemos interpretar que aquellas zonas blancas son zonas que presentan poca o ninguna correlación mientras que las rojas más intensas presentan una fuerte correlación positiva y siendo el azul el que represente esta correlación negativa.
+
+Eso que quiere decir, para poder interpretar estos valores debemos considerar el valor absoluto como medida de la magnitud y el signo para evaluar la dirección de la asociación.
+
+Como hemos dicho antes, si el valor de la **magnitud** es cercano a 0, esto quiere decir que no hay una clara asociación entre ambos, por otro lado, cuanto más se aleje del 0 mayor será la fuerza de asociación.
+
+En cuanto al **signo**, si el valor de la correlación entre un predictor y una variable respuesta tiene signo positivo (color rojo), esto quiere decir que, conforme aumenta el predictor aumenta la variable respuesta o viceversa (correlación no implica causalidad). En cambio, si el valor de la correlación tiene signo negativo (color azul), significa que ambos siguen tendencias contrarias, cuando uno aumenta o el otro disminuye.
+
+Al tener tantos valores de correlación no sabría decir si una correlación es cierta o solamente un falso positivo. Para llegar a saber si es buena o es al azar se deben llevar a cabo tests de correlación. Por ello ahora realizaremos un estudio de **PCA**( en español, analisis de componentes principales), con el fin de estudiar la correlación de estos datos y reducir su dimensionalidad, simplificando así el análisis y mejorando la visualización de datos complejos proporcionando así una información valiosa, además de ayudarnos a evitar la colinealidad.
+
+Durante la realización de este trabajo consideré realizar en este punto un modelo de regresión Backward para ver que variables podemos quitar para mejorar los datos.Luego a consejo del tutor, se consideró no hacerlo por el hecho de que todas las variables son importantes como para quitarlas. Aún así, con este código se obtendrían unos valores mucho mejores a los obtenidos mediante el proceso estándar y en este caso no, peo en otro trabajo podría requerir que se hiciese para mejorar los datos si se pudiesen quitar variables con poca relevancia.
+
+
+dc_subset_lm <- cbind(resp.pCr_original,dc_subset)
+
+modelo_inicial_dc <- glm(resp.pCR ~ ., data = dc_subset_lm, family = "binomial")
+
+modelo_final_dc <- step(modelo_inicial_dc, direction = "backward")
+
+Quitamos las variables que empeoran nuestra regresion
+
+dc_subset_lm_1 <- dc_subset_lm [, -c(7,8,9,11,13,16,17,18,19,21,22,23,24,25,29,30)]
+
+Las representaciones y el estudio mejora drasticamente despues de este trantamiento pero haciendolo perderíamos
+variables importantes por lo que no interesa.
+
+
+## Pregunta (1.0 puntos)
+
+A la luz de un plot PCA de los dos primeros componentes principales de cada una de las pacientes, a partir de los datos clínicos del fichero `Main.csv`, ¿se aprecia cierta separabilidad entre las pacientes, según sus valores posibles de respuesta a la cirugía tras el tratamiento adyuvante? Desarrolla la respuesta ¿Qué variables serían las más relevantes en ambos ejes y cómo lo interpretas?
+
+Aquí realizaré la PCA del subconjunto de datos clinicos en que no están presentes las variables categóricas.
+
+Al ya tener los valores escalados utilizamos el argumento scale=FALSE.Escalar los valores nos ayuda a centrar estas en el 0 haciendo así la comparación entre ellas más sencilla. Esto lo hacemos ya que no todas las variables están en la misma escala y si no lo hiciesemos no tendríamos unos buenos datos para trabajar con ellos.
+
+```{r}
+pca = prcomp(dc_subset, center = FALSE, scale. = FALSE)
+```
+
+Ahora debemos ver los datos para su interpretación.
+
+
+```{r}
+screeplot(pca, type = "lines", main = "Estudio de PCA", col = "blue")
+text(seq_along(pca$sdev), pca$sdev, labels = names(pca$sdev), col = "black", pos = 4)
+
+```
+**Fig.8**
+
+**Fig.8** En esta representación vemos como la mayoría de la información se encuentra concentrada en las primeras 4 columnas.
+
+La varianza y la desviación estándar son medidas de dispersión relacionadas entre sí, ya que la desviación estándar es la raíz cuadrada de la varianza. La principal diferencia entre ellas es que la varianza es una medida de dispersión cuadrática, lo que significa que los valores de la varianza son más grandes que los valores de la desviación estándar. Por lo tanto, la desviación estándar es una medida de dispersión más interpretable que la varianza, ya que está expresada en las mismas unidades que los datos originales.
+
+La función prcomp nos muestra la desviación estándar de cada componente principal.
+```{r}
+pca$sdev
+```
+
+La varianza explicada por cada componente principal se obtiene mediante la cuadratura de estos valores.Y para la proporción de la varianza explicada por cada componente principal, simplemente dividimos la varianza explicada por cada componente principal por la varianza total explicada por los componentes principales:
+```{r}
+VE <- pca$sdev^2
+PVE <- VE / sum(VE)
+round(PVE, 2)
+```
+Como podemos ver,la primera componente principal posee un 26% de la varianza de los datos, el siguiente componente principal explica el 15% de la varianza,y así sucesivamente. Como podemos ver, a partir de la componente 25 dejamos de ver valores.
+
+```{r}
+# Obtener las cargas de las variables en cada componente principal
+cargas <- pca$rotation
+#View(cargas) #Viendo las cargas, donde la función rotation de la PCA  proporciona los loadings de los componentes principales; cada columna de pca_result$rotation contiene el correspondiente vector de carga de los componentes principales.
+
+# Ordenar los componentes principales por varianza explicada
+orden <- order(PVE, decreasing = TRUE)
+
+# Identificar las variables más importantes en los primeros componentes principales
+n_vars_importantes <- 5  # número de variables a considerar
+vars_importantes <- rep(NA, n_vars_importantes)
+for (i in 1:n_vars_importantes) {
+  vars_componente <- order(abs(cargas[orden[i], ]), decreasing = TRUE)[1:n_vars_importantes]
+  vars_importantes[i] <- vars_componente[i]
+}
+
+# Mostrar las variables más importantes en los primeros componentes principales
+print(vars_importantes)
+
+```
+
+Las variables más importantes para la PC1 son **"TIDE.IFNG"**, **"GEP.gsva"** y **"CytScore.log2"** mientras que para la PC2 las variables más importantes son **"Swanton.PaclitaxelScore"**, **"ESC.ssgsea.notnorm"** y **"GGI.ssgsea.norm"**.
+
+Digo que son las más importantes por ser las que tienen valores más elevados con respecto a sus valores de loadings, por lo tanto estos no serán falsos positivos y sí serán importantes por su correlación. Con estos datos podemos decir que las correlaciones son verdaderas.
+
+No obstante,este tipo de gráfica como hemos dicho antes solo nos informa acerca de cuanta información lleva cada PCA. Podemos utilizar un biplot pero al tener una muestra tan grande de datos no nos va a ayudar.
+
+Vamos a hacer un scatter plot, para la función predict, el dataset relacionado con 'newdata' para la predicción debe tener las mismas variables que el conjunto de datos original, ya que las proyecciones en los componentes principales se basan en las relaciones lineales entre las variables :
+
+```{r}
+pca_resultado <- predict(pca, newdata = dc_subset)[, 1:2]
+
+df_pc <- data.frame(PC1 = pca_resultado[, 1], PC2 = pca_resultado[, 2])
+
+ggplot(df_pc, aes(x = PC1, y = PC2)) + 
+  geom_point()
+
+```
+**Fig.9**
+
+**Fig.9** Representación de la **PCA** para las dos componentes principales.
+
+Ahora colorearemos el gráfico.
+
+
+```{r}
+# Crear líneas delimitadoras
+vline <- geom_vline(xintercept = 0, linetype = "dashed")
+hline <- geom_hline(yintercept = 0, linetype = "dashed")
+
+colors <- c("red", "blue")
+labels_scatter <- c("Grupo 1", "Grupo 2")
+
+# Scatter plot
+grafica_scat_pca <- ggplot(df_pc, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(color = factor(datos_clinicos_copy_filt$resp.pCR))) + 
+  scale_color_manual(values = colors, labels = labels_scatter) + 
+  xlab(paste0("PC1 (", round(PVE[1]/sum(PVE)*100, 2), "%)")) + 
+  ylab(paste0("PC2 (", round(PVE[2]/sum(PVE)*100, 2), "%)")) + 
+  ggtitle("Gráfico de las dos primeras componentes principales") + 
+  theme(plot.title = element_text(hjust = 0.5)) # centrar título
+
+
+grafica_scat_pca <- grafica_scat_pca + vline + hline
+
+grafica_scat_pca
+
+```
+
+**Fig.10**
+
+**Fig.10** Misma representación que en la **Fig.9** pero diferenciando por colores las componentes principales.
+
+**Interpretación:**
+
+Veo los dos grupos bastante entremezclados, el grupo 1 se concentra en las partes inferior derecha y superior derecha mientras, que el grupo 2 se dispersa por la parte superior izquierda e inferior izquierda. No obstante, puedo ver una separabilidad de estos datos ya que los nucleos de puntos de los diferentes grupos están alejados entre sí y los puntos mezclados es lo que podríamos esperar de una muestra de datos cercana a la realidad.
+
+La visualización de una separabilidad en un scatter plot puede indicar la existencia de distintas categorías o subgrupos dentro del conjunto de datos que comparten características similares.Puntos de distintos grupos que esten cerca indican que estan relacionados a pesar de formar parte de distintas componentes principales.
+
+La separabilidad también puede ser útil para la construcción de modelos predictivos, ya que una clara separación entre los datos puede sugerir que un modelo basado en esas variables sería capaz de predecir la pertenencia de una nueva observación a uno de los grupos.
+
+Sin embargo, es importante tener en cuenta que la separabilidad en un scatter plot de una PCA con dos componentes principales no siempre es definitiva. A menudo, los datos pueden presentar cierto grado de solapamiento entre los grupos, lo que puede dificultar la identificación clara de subgrupos en el conjunto de datos original. Además, la separabilidad puede ser una función de la elección de variables utilizadas en la PCA, por lo que es importante realizar análisis adicionales para verificar y validar cualquier patrón identificado.
+
+**Se recomendaría** un en este caso, un algoritmo de clustering como el algoritmo **k-means**, que es ampliamente utilizado y relativamente simple de implementar. Esto nos serviría para mejorar el estudio de la PCA y mejorar su separabilidad facilitando así la identificación de patrones y estructuras ocultas en los datos.
+
+- **¿Qué variables serían las más relevantes en ambos ejes y cómo lo interpretas?** TIDE.IFNG para la carga 1 junto con GEP.gsva y CytScore.log2. Mientras que para la carga 2 es Swanton.PaclitaxelScore y ESC.ssgsea.notnorm. He intentado representar los vectores de las variables con los loadings para poder verlos en la representación pero debido a que las variables que tenemos tienen los valores tan semejantes entre ellos y están igual de correlacionados con cada componente principal, no se puede diferenciar cuál de ellas es la más importante. 
+
+
+
+# Predicción de respuesta al tratamiento (6.5 puntos)
+
+## Pregunta (1 puntos)
+
+Elabora sendos modelos de regresión logística para predecir la respuesta al tratamiento, según la variable `resp.pCR` elaborando modelos por separado para cada uno de los cuatro grupos de datos: clínicos, de análisis digital, del sistema inmune y de transcriptómica. Analiza los resultados generados por el comando `summary(glm(modelo, family="binomial))` según las preguntas ¿es el modelo generado adecuado o se detectan problemas al generarlo? ¿cuál es su capacidad predictiva? ¿podemos determinar los predictores relevantes a la vista del resultado de la función `summary()`?
+
+Preparación de los datos de **'resp.pCR'**:
+
+- **Datos clinicos escalados y con resp.pCR**
+
+```{r}
+dc_subset_glm <- cbind(dc_subset, resp.pCr_original)
+
+glm_dc <- glm(resp.pCR ~ ., data=dc_subset_glm,family=binomial(link="logit"))
+
+summary(glm_dc)
+ 
+trainIndex_dc <- createDataPartition(dc_subset_glm$resp.pCR, p = 0.8, list = FALSE)
+train_dc <- dc_subset_glm[trainIndex_dc, ]
+test_dc <- dc_subset_glm[-trainIndex_dc, ]
+
+# Ajustar el modelo de regresión logística
+model_dc <- caret::train(resp.pCR ~ ., data = train_dc, method = "glm", family = "binomial")
+
+# Realizar predicciones en el conjunto de prueba
+pred_dc <- predict(model_dc, newdata = test_dc)
+
+# Evaluar el rendimiento del modelo
+confusionMatrix(pred_dc, test_dc$resp.pCR)
+
+# Comprobar si los valores estan balanceados
+table(dc_subset_glm$resp.pCR)
+
+# Balanceamos los datos para asi tener las mismas posibilidades de datos positivos que negativos
+#dc_subset_glm_balanced <- downSample(dc_subset_glm, dc_subset_glm$resp.pCR)
+
+# Comprobacion de que estan balanceados
+#table(dc_subset_glm_balanced$resp.pCR)
+```
+Se ha decidido no balancear los datos por el número de positivos y negativos que tenemos, al no ser serio se decide no hacerlo.
+
+Estos son los resultados de evaluación de un modelo de clasificación binaria, que se ha evaluado utilizando diferentes métricas de rendimiento:
+
+- **Accuracy (Precisión):** Es la proporción de predicciones correctas realizadas por el modelo, expresada como un valor entre 0 y 1. En este caso, el valor es 0.8214, lo que significa que el modelo tiene una precisión del 82.14% en la clasificación de las clases.
+
+- **95% CI (Intervalo de Confianza):** Es el intervalo de confianza del 95% para la precisión del modelo. En este caso, el intervalo de confianza es (0.6311, 0.9394), lo que significa que con un 95% de confianza, la verdadera precisión del modelo se encuentra dentro de este rango.Tomaría este valor como aceptable.
+
+- **No Information Rate (Tasa de Información Nula):** Es la precisión que se obtendría si se predijera siempre la clase más frecuente. En este caso, la tasa de información nula es 0.75, lo que significa que el modelo tiene un rendimiento mejor que simplemente predecir siempre la clase más frecuente.
+
+-  **P-Value [Acc > NIR] (Valor P [Precisión > Tasa de Información Nula]):** Es el valor P que compara la precisión del modelo con la tasa de información nula. Un valor P alto (cerca de 1) indica que la precisión del modelo no es significativamente diferente de la tasa de información nula.
+
+- **Kappa:** Es una medida de concordancia entre las predicciones del modelo y las etiquetas de clase verdaderas, teniendo en cuenta el acuerdo esperado al azar. Un valor de kappa de 1 indica una concordancia perfecta, mientras que un valor de 0 indica concordancia al azar. En este caso, el valor de kappa es 0.5455, lo que indica una concordancia moderada entre las predicciones del modelo y las etiquetas de clase verdaderas.
+
+- **Mcnemar's Test P-Value (Valor P de la Prueba de McNemar):** Es el valor P para la prueba de McNemar, que compara las predicciones del modelo en pares de observaciones discordantes. Un valor P alto (cerca de 1) indica que no hay evidencia de diferencia significativa en las predicciones erróneas del modelo.
+
+- **Sensitivity (Sensibilidad):** Es la proporción de verdaderos positivos (TP) respecto al total de positivos (TP + FN). En este caso, la sensibilidad del modelo es 0.8571, lo que indica la capacidad del modelo para identificar correctamente la clase positiva.
+
+- **Specificity (Especificidad):** Es la proporción de verdaderos negativos (TN) respecto al total de negativos (TN + FP). En este caso, la especificidad del modelo es 0.7143, lo que indica la capacidad del modelo para identificar correctamente la clase negativa.
+
+- **Pos Pred Value (Valor Predictivo Positivo):** Es la proporción de verdaderos positivos (TP) respecto al total de predicciones positivas (TP + FP). En este caso, el valor predictivo positivo del modelo es 0.9000, lo que indica la precisión de las predicciones positivas del modelo.
+
+- **Neg Pred Value (Valor Predictivo Negativo):** Es la proporción de verdaderos negativos (TN) respecto al total de predicciones negativas (TN + FN). En este caso, el valor predictivo negativo del modelo es 0.6250, lo que indica la precisión de las predicciones negativas del modelo.
+
+- **Prevalence (Prevalencia):** Es la proporción de la clase positiva en el conjunto de datos. En este caso, la prevalencia de la clase positiva es 0.7500, lo que indica la proporción de observaciones positivas en el conjunto de datos.
+
+- **Detection Rate (Tasa de Detección):** Es la proporción de observaciones positivas correctamente clasificadas como positivas (TP) respecto al total de observaciones positivas (TP + FN). En este caso, la tasa de detección del modelo es 0.6429, lo que indica la capacidad del modelo para detectar correctamente la clase positiva.
+
+- **Detection Prevalence (Prevalencia de Detección):** Es la proporción de observaciones clasificadas como positivas (TP + FP) respecto al total de observaciones (N). En este caso, la prevalencia de detección del modelo es 0.7143, lo que indica la proporción de observaciones clasificadas como positivas por el modelo.
+
+- **Balanced Accuracy (Exactitud Equilibrada):** Es el promedio de la sensibilidad y la especificidad del modelo, lo que proporciona una medida equilibrada del rendimiento del modelo en ambas clases. En este caso, la exactitud equilibrada del modelo es 0.7857, lo que indica el rendimiento general del modelo en ambas clases.
+
+Y la clase que tenemos como positiva es la '0'lo que significa que el paciente es negativo, es decir, que no tiene cáncer.
+
+Viendo y comparando los datos podría decir que los resultados para este modelo son favorables.
+
+Si tuviesemos que elegir unos **predictores relevantes** en este modelo diriamos que son **Age.at.diagnosis**, **median_lymph_KDE_knn_50** y **ERBB2.log2.tpm**. 
+
+```{r}
+summary(model_dc)
+```
+  Tras este resumen realizado con los datos clinicos con respecto a la variable resp.pCR es que dar valores de Pr de 1.00 o de 0.99 nos indican que la variable independiente correspondiente no tiene un efecto estadísticamente significativo en el modelo.
+  
+  En la mayoría de los casos, un valor de p alto indica que la variable independiente no es un predictor significativo de la variable dependiente y que no hay suficiente evidencia para rechazar la hipótesis nula de que el coeficiente correspondiente es igual a cero. En otras palabras, el coeficiente no es diferente de cero y no contribuye significativamente al modelo.
+  
+  Sin embargo, es importante tener en cuenta que un valor de p alto no significa necesariamente que la variable independiente no tenga un efecto práctico o que no sea relevante para la variable dependiente. En algunos casos, un coeficiente que no es estadísticamente significativo en un modelo específico puede ser significativo en combinación con otras variables o en diferentes contextos.
+  
+  Al no tener valores de p inferiores a 0.05 podemos decir que el modelo no es adecuado ya que no son estadisticamente significativas.
+  
+  Con el número de Fisher podemos deducir que el modelo es sencillo ya que 25 iteraciones son pocas para el algóritmo. Es a partir de 100 cuando podríamos decir que estamos ante un modelo complejo.
+
+```{r}
+summary(pred_dc)
+```
+Para comprobar si es un buen modelo predictor deberiamos añadir el estudio de una curva ROC.
+
+```{r}
+pred_probs_dc <- predict(model_dc, newdata = test_dc, type = "prob")
+
+pred_probs_positive_dc <- pred_probs_dc[, "1"]
+
+roc_data_dc <- data.frame(prediction = pred_probs_positive_dc, actual = test_dc$resp.pCR)
+
+roc_curve_dc <- roc(roc_data_dc$actual, roc_data_dc$prediction)
+
+
+```
+```{r}
+
+plot(roc_curve_dc, main = "Curva ROC de datos clinicos", xlab = "Tasa de Falsos Positivos", ylab = "Tasa de Verdaderos Positivos")
+
+```
+**Fig.11**
+
+**Fig.11** Representación de la curva ROC del modelo realizado para datos clinicos.
+
+**Interpretación:**
+
+En una curva ROC, el área bajo la curva (AUC) se muestra en la leyenda del gráfico y representa el rendimiento del modelo en términos de discriminación entre las clases positiva y negativa. Un AUC cercano a 1 indica un buen rendimiento del modelo en la clasificación de las clases, mientras que un AUC cercano a 0.5 indica un rendimiento similar al azar.
+
+En este caso, vemos como podemos llegar a considerar que este modelo es satisfactorio y que está por encima del 0.5 que indicaría un rendimiento al azar.Por lo que este modelo si nos sirve para hacer predicciones.
+
+- **Analisis digital y resp.pCR**
+
+```{r}
+scaled_ad_subset <- scale(analisis_digital_copy_filt[,1:7])
+
+scaled_ad_subset <- cbind(scaled_ad_subset, resp.pCr_original)
+
+#Entrenar los valores
+trainIndex_ad <- createDataPartition(scaled_ad_subset$resp.pCR, p = 0.7, list = FALSE)
+train_ad <- scaled_ad_subset[trainIndex_ad,]
+test_ad <- scaled_ad_subset[-trainIndex_ad,]
+
+train_ad$resp.pCR = as.factor(train_ad$resp.pCR)
+test_ad$resp.pCR = as.factor(test_ad$resp.pCR)
+# Regresión logística 
+
+model_ad <- caret::train(resp.pCR ~ ., data = train_ad, method = "glm", family = "binomial")
+
+# Predicción sobre los datos de validación
+pred_ad <- predict(model_ad, newdata = test_ad)
+
+# Evaluar el modelo
+confusionMatrix(pred_ad, test_ad$resp.pCR)
+
+
+```
+Este modelo presenta precisión del 71% por lo que medirá bien en la mayoría de los casos las predicciones positivas del modelo. Una exactitud entre el 55 y el 64% por lo que es probable que haga predicciones correctas, pero aún así están demasiado cercanas al 50% en el 95% de los casos por lo que no lo tomaría como fiable.
+
+En cuanto a la sensibilidad, es muy elevada casi un 93% pero sin embargo la especificidad es de un 9% esto significa que el modelo tiene una baja capacidad para clasificar correctamente los casos negativos.
+
+Un valor de Specificity tan bajo puede indicar que el modelo está teniendo dificultades para identificar correctamente los casos negativos, lo que puede resultar en un alto número de falsos positivos. Esto podría tener implicaciones en la precisión y confiabilidad del modelo en términos de su capacidad para clasificar los casos correctamente, especialmente si la identificación de los casos negativos es importante en el contexto del problema que se está abordando con el modelo de regresión logística binaria. 
+
+El Neg Pred Value nos vuelve a decir lo mismo que lo comentado en el caso anterior, al ser tan bajo 0.333 nos indica que el modelo tiene una baja capacidad para predecir correctamente los casos negativos.
+
+Por esto, considero que no sería un buen modelo salvo para detectar correctamente los casos positivos pero no los casos negativos.Entonces, este modelo presenta dificultades y habría que considerar en mejorarlo.
+
+Tampoco puedo decir que ninguna **variable es relevante** ya que sus valores de p no son lo suficientemente significativos.
+
+```{r}
+summary(model_ad)
+```
+
+
+```{r}
+summary(pred_ad)
+```
+Ahora vamos a comprobar su capacidad predictora.
+
+```{r}
+pred_probs_ad <- predict(model_ad, newdata = test_ad, type = "prob")
+
+pred_probs_positive_ad <- pred_probs_ad[, "1"]
+
+roc_data_ad <- data.frame(prediction = pred_probs_positive_ad, actual = test_ad$resp.pCR)
+
+roc_curve_ad <- roc(roc_data_ad$actual, roc_data_ad$prediction)
+
+plot(roc_curve_ad, main = "Curva ROC de analisis digital", xlab = "Tasa de Falsos Positivos", ylab = "Tasa de Verdaderos Positivos")
+```
+**Fig.12**
+
+**Fig.12** Representación de la curva ROC del modelo realizado para analisis digital.
+
+**Interpretación:**
+
+Esta representación nos muestra valores cercanos a la diagonal lo que nos dice que el modelo tiene un rendimiento similar al azar o que su capacidad de discriminación entre las clases es limitada. La diagonal en la curva ROC representa un modelo con una tasa de verdaderos positivos igual a la tasa de falsos positivos, lo cual sería equivalente a un clasificador aleatorio que no tiene capacidad para discriminar entre las clases.
+
+Lo que puede decirnos es que el modelo no está capturando bien las características distintivas de las clases o que está realizando predicciones incorrectas con una alta tasa de falsos positivos y falsos negativos.
+
+Por lo tanto, este modelo no funciona como modelo predictivo.
+
+- **Sistema inmune y resp.pCR**
+
+```{r}
+sistema_inmune_copy_filt$Trial.ID <- NULL
+
+scaled_si_subset <- scale(sistema_inmune_copy_filt[,1:32])
+
+si_subset <- scaled_si_subset[, -c(14,23)]
+
+si_subset <- cbind(si_subset, resp.pCr_original) 
+
+#Entrenar los valores
+trainIndex_si <- createDataPartition(si_subset$resp.pCR, p = 0.7, list = FALSE)
+train_si <- si_subset[trainIndex_si,]
+test_si <- si_subset[-trainIndex_si,]
+
+train_si$resp.pCR = as.factor(train_si$resp.pCR)
+test_si$resp.pCR = as.factor(test_si$resp.pCR)
+
+# Regresión logística 
+
+train_si <- train_si[, -c(16, 18, 28)]
+model_si <- caret::train(resp.pCR ~ ., data = train_si, method = "glm", family = "binomial")
+
+# Predicción sobre los datos de validación
+pred_si <- predict(model_si, newdata = test_si)
+
+# Evaluar el modelo
+confusionMatrix(pred_si, test_si$resp.pCR)
+```
+En este modelo vemos que tiene un 0.71 de precisión para medir los casos positivos y una exactitud entre un 0.55 y 0.84 de que estas predicciones sean correctas, algo bajo lo cuál no es muy bueno. Una sensibilidad del 0.90 y una especificidad del 0.18,lo que implica que tiene una alta tasa de falsos positivos, es decir, predicciones positivas incorrectas en casos negativos.
+
+El valor de Valor Predictivo Positivo es 0.75, lo que indica la proporción de predicciones positivas correctas en relación con el total de predicciones positivas. Mientras que el Valor Predictivo Negativo es 0.40, lo que indica la proporción de predicciones negativas correctas en relación con el total de predicciones negativas. Ambos valores podrían ser mejorados, ya que el Valor Predictivo Positivo no es muy alto y el Valor Predictivo Negativo es bastante bajo.
+
+La Balanced Accuracy  es 0.54, que es el promedio de Sensibilidad y Especificidad. Este valor se encuentra cercano a la diagonal, lo que indica que el modelo no tiene un buen equilibrio entre la Sensibilidad y la Especificidad.
+
+En general, estos valores indican que el modelo tiene una alta sensibilidad pero baja especificidad, y los valores predictivos podrían ser mejorados. 
+
+
+```{r}
+summary(model_si)
+```
+
+
+```{r}
+summary(pred_si)
+```
+Quitar los valores NA del summary puede ser tentador pero si lo hacemos, estaremos perdiendo información así que es mejor no hacerlo sino tratar esos datos de una manera adecuada.
+
+Debido a estos valores NA, puede que las **variables relevantes** queden enmascaradas por lo que no puedo concretar cual de ellas lo es.
+
+```{r}
+pred_probs_si <- predict(model_si, newdata = test_si, type = "prob")
+
+pred_probs_positive_si <- pred_probs_si[, "1"]
+
+roc_data_si <- data.frame(prediction = pred_probs_positive_si, actual = test_si$resp.pCR)
+
+roc_curve_si <- roc(roc_data_si$actual, roc_data_si$prediction)
+
+plot(roc_curve_si, main = "Curva ROC de sistema inmune", xlab = "Tasa de Falsos Positivos", ylab = "Tasa de Verdaderos Positivos")
+```
+**Fig.13**
+
+**Fig.13** Representación de la curva ROC del modelo realizado para sistema inmune.
+
+**Interpretación:**
+
+Los valores de esta representación están por encima de la curva y no llegan a estar por debajo por lo que diría que es un modelo favorable de predicción. Al menos no llega a dar valores al azar como en el modelo anterior por lo tanto, lo considero superior pero tampoco me fiaría mucho de su fiabilidad.
+
+
+- **Transcriptomica y resp.pCR**
+
+
+```{r}
+transcrip_copy_filt <- as.numeric(transcrip_copy_filt)
+
+
+scaled_tr_subset <- scale(transcrip_copy_filt)
+
+tr_subset <- cbind(scaled_tr_subset, resp.pCr_original) 
+#Entrenar los valores
+
+
+trainIndex_tr <- createDataPartition(tr_subset$resp.pCR, p = 0.7, list = FALSE)
+train_tr <- tr_subset[trainIndex_tr,]
+test_tr <- tr_subset[-trainIndex_tr,]
+
+nzv <- nearZeroVar(train_tr, saveMetrics = TRUE)
+
+
+train_tr <- train_tr[, nzv$nzv==FALSE]
+test_tr <- test_tr[, nzv$nzv==FALSE]
+
+# Convertir variable respuesta a factor
+train_tr$resp.pCR = as.factor(train_tr$resp.pCR)
+test_tr$resp.pCR = as.factor(test_tr$resp.pCR)
+
+# Entrenar modelo de regresión logística
+#system.time(model_tr <- caret::train(resp.pCR ~ ., data = train_tr, method = "glm", family = "binomial", trControl = trainControl(method = "cv", number = 10,  verboseIter = TRUE)))
+
+# Guardar modelo entrenado
+#saveRDS(model_tr, file = "model_tr.RDS")
+
+# Cargar modelo entrenado
+model_tr <- readRDS("model_tr.RDS")
+
+# Realizar predicciones sobre el conjunto de prueba
+pred_tr <- predict(model_tr, newdata = test_tr)
+
+# Evaluar el modelo
+confusionMatrix(pred_tr, test_tr$resp.pCR)
+```
+
+El problema con este modelo es que tiene una extrema sensibilidad y una nula especificidad. Lo que significa que es capaz de detectar correctamente todos los casos positivos pero no es capaz de detectar ningún caso negativo. Además, el valor predictivo negativo no se puede calcular debido a que no se han realizado predicciones negativas. Esto presenta una serie de dificultades con el modelo.
+
+También es importante recalcar el alto consumo de computo que conlleva este dataset y que al tener una **variables predictoras** con altos p-value no podemos discernir entre los que son importantes y los que no.
+
+Ahora vamos a ver su capacidad predictora:
+
+```{r}
+pred_probs_tr <- predict(model_tr, newdata = test_tr, type = "prob")
+
+pred_probs_positive_tr <- pred_probs_tr[, "1"]
+
+roc_data_tr <- data.frame(prediction = pred_probs_positive_tr, actual = test_tr$resp.pCR)
+
+roc_curve_tr <- roc(roc_data_tr$actual, roc_data_tr$prediction)
+
+plot(roc_curve_tr, main = "Curva ROC de transcriptomica", xlab = "Tasa de Falsos Positivos", ylab = "Tasa de Verdaderos Positivos")
+```
+**Fig.14**
+
+**Fig.14** Representación de la curva ROC del modelo realizado para transcriptomica.
+
+**Interpretación:**
+
+Que la línea de la curva ROC coincida perfectamente con la diagonal significa que el modelo no tiene capacidad de discriminación y su rendimiento es similar al azar. Por lo tanto, no sería un modelo adecuado a usar.
+
+
+
+## Pregunta (1 puntos)
+
+Haciendo uso de Caret, elabora sendos modelos de bosques aleatorios haciendo uso de un paquete como `ranger` o similar. Crea modelos por separado para cada uno de los cuatro grupos de datos: clínicos, de análisis digital, del sistema inmune y de transcriptómica. Analiza los resultados desde el punto de vista de la relevancia de los predictores correspondientes usando `varImp()`, representando los correspondientes plots facilitados por Caret para ello. Comenta los resultados. Nota: añade `importance="permutation"` a la llamada `train()` correspondiente si haces uso de `ranger` para que `varImp()` funcione correctamente.
+
+
+Un **random Forest** es un algoritmo de aprendizaje automático que se utiliza en tareas de clasificación, regresión y otros problemas de análisis predictivo. Construir múltiples árboles con diferentes subconjuntos de datos reducirá el sobreajuste y se mejorará la precisión predictiva del modelo.Vamos a pasar ahora a los datos entrenados por un modelo **"ranger"**, este algoritmo implementa Random Forest utilizando paralelismo y optimizaciones para mejorar la velocidad y la escalabilidad del algoritmo.
+
+Con esto buscamos mejorar la precisión obtenida en la regresión logística.
+
+- Entrenamiento Random Forest de los datos de train de **datos clinicos**.
+
+
+Hemos añadido un **trControl** con el fin de definir la estrategia de validación cruzada para evaluar el rendimiento de una manera más robusta y precisa.
+
+```{r}
+# Dividir el conjunto de datos en conjuntos de entrenamiento y prueba
+
+#dc_subset_glm_balanced$Class = NULL #aqui he quitado la variable class obtenida durante el balanceo ya que se lleva toda la importancia
+
+# Dividir los datos en conjuntos de entrenamiento y prueba
+train_index_rf_dc <- createDataPartition(dc_subset_glm$resp.pCR, p = 0.7, list = FALSE)
+train_data_rf_dc <- dc_subset_glm[train_index_rf_dc, ]
+test_data_rf_dc <- dc_subset_glm[-train_index_rf_dc, ]
+
+# Definir los parámetros de control de entrenamiento
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     returnResamp = "final",
+                     verboseIter = FALSE,
+                     search = "random")
+
+# Definir la cuadrícula de ajuste para el modelo de Random Forest
+tune_grid_dc <- expand.grid(mtry = 1:ncol(train_data_rf_dc), 
+                         splitrule = c("gini", "extratrees"),
+                         min.node.size = c(1, 5, 10))
+
+
+# Entrenar el modelo de Random Forest
+#rf_model_dc <- caret::train(resp.pCR ~ ., 
+                            #data = train_data_rf_dc,
+                            #preProcess = NULL,
+                            #method = "ranger",
+                            #trControl = ctrl,
+                            #tuneGrid = tune_grid_dc, 
+                            #importance = "permutation", 
+                            #num.trees = 500)
+
+#saveRDS(rf_model_dc, file = "rf_model_dc.RDS")
+
+rf_model_dc <- readRDS("rf_model_dc.RDS")
+
+# Realizar predicciones en el conjunto de prueba
+pred_rf_dc <- predict(rf_model_dc, newdata = test_data_rf_dc)
+
+# Obtener la importancia de las variables
+valor_rf_dc <- varImp(rf_model_dc)
+
+# Evaluar el rendimiento del modelo
+confusionMatrix(pred_rf_dc, test_data_rf_dc$resp.pCR)
+```
+Con estos valores obtenidos podemos sacar en claro que este modelo acierta el 73,81% de las veces en sus predicciones.Que su CI ,intervalo de confianza está entre 0.5796 y 0.8614, lo que significa que se estima con un 95% de confianza que la exactitud real del modelo se encuentra dentro de ese rango.
+
+La sensibilidad del modelo es del 83.87%, lo que significa que el modelo tiene una alta capacidad para detectar los casos positivos.
+
+La especificidad del modelo es del 45.45%, lo que significa que el modelo tiene una capacidad moderada para detectar los casos negativos.
+
+Viendo el resto de valores vemos que la capacidad de predecir los valores positivos es buena pero la de los valores negativos es un tanto baja(50%). Siendo el balance de precisión de un 64%.
+
+
+
+```{r}
+# Representación gráfica de la importancia de las variables
+plot(valor_rf_dc, main = "Importancia de las Variables")
+```
+**Fig.15**
+
+**Fig.15**Podemos ver en este caso como la variable predictora **Danaher.Mast.cells** es la que tiene una mayor relevancia en este random forest.
+
+
+```{r}
+valor_rf_dc
+```
+
+
+
+- Entrenamiento Random Forest de los datos de train de **analisis digital.**
+
+```{r}
+#model_ad_rf <- caret::train(resp.pCR ~ ., data = train_ad, method = "ranger", importance = "permutation", num.trees = 500,trControl = ctrl)
+
+#saveRDS(model_ad_rf, file = "model_ad_rf.RDS")
+
+model_ad_rf <- readRDS("model_ad_rf.RDS")
+
+# Predicción sobre los datos de validación
+pred_ad_rf <- predict(model_ad_rf, newdata = test_ad)
+
+# Evaluar el modelo
+confusionMatrix(pred_ad_rf, test_ad$resp.pCR)
+
+valor_rf_ad <- varImp(model_ad_rf)
+
+#representación de la importancia en este dataset
+plot(valor_rf_ad,main="Importancia de las Variables datos clinicos")
+```
+**Fig.16**
+
+**Fig.16** En esta representación vemos como la variable **fraction_cancer** es la que tiene mayor relevancia.
+
+```{r}
+valor_rf_ad
+```
+
+- Entrenamiento Random Forest de los datos de train de **sistema inmune.**
+
+```{r}
+#model_si_rf <- caret::train(resp.pCR ~ ., data = train_si, method = "ranger", importance = "permutation", num.trees = 500,trControl = ctrl)
+
+
+#saveRDS(model_si_rf , file = "model_si_rf.RDS")
+
+model_si_rf  <- readRDS("model_si_rf.RDS")
+
+# Predicción sobre los datos de validación
+pred_si_rf <- predict(model_si_rf, newdata = test_si)
+
+# Evaluar el modelo
+confusionMatrix(pred_si_rf, test_si$resp.pCR)
+
+valor_rf_si <- varImp(model_si_rf)
+
+#representación de la importancia en este dataset
+plot(valor_rf_si,main="Importancia de las Variables de sistema inmune")
+```
+**Fig.17**
+
+**Fig.17** En esta representación vemos como la variable **Signature.26** es la que tiene mayor relevancia.
+
+```{r}
+valor_rf_si
+```
+
+- Entrenamiento Random Forest de los datos de train de **transcriptómica.**
+
+```{r}
+tune_grid_tr <- expand.grid(mtry = 1:ncol(train_tr), 
+                         splitrule = c("gini", "extratrees"),
+                         min.node.size = c(1, 5, 10))
+
+
+#model_tr_rf <- caret::train(resp.pCR ~ ., 
+                            #data = train_tr, 
+                            #method = "ranger", 
+                            #importance = "permutation", 
+                            #num.trees = 500,
+                            #trControl = ctrl,
+                            #tuneGrid = tune_grid_tr)
+
+#saveRDS(model_tr_rf , file = "model_tr_rf.RDS")
+
+model_tr_rf  <- readRDS("model_tr_rf.RDS")
+
+# Predicción sobre los datos de validación
+pred_tr_rf <- predict(model_tr_rf, newdata = test_tr)
+
+# Evaluar el modelo
+confusionMatrix(pred_tr_rf, test_tr$resp.pCR)
+
+valor_rf_tr <- varImp(model_tr_rf)
+
+```
+
+Debido a estos resultados, hacer una representación no ayuda a visualizar los valores o decir cuál es la **variable representativa** ya que los valores son al azar.
+
+## Pregunta (1 puntos)
+
+Haciendo uso de Caret, optimiza una red neuronal de la familia (mlpKeras) con los datos de Main.csv y compáralo cuantitativa y cualitativamente, con el modelo ranger análogo de la pregunta anterior. ¿Es posible obtener, con los medios que conocemos, una estimación sobre qué predictores considera la red neuronal como más importantes? 
+
+```{r}
+
+train_x = train_dc
+train_y = train_dc$resp.pCR
+train_x$resp.pCR = NULL
+levels(train_y) <- c("neg","pos")
+
+ctrl_red = trainControl(method="boot",
+                       number=10,
+                       search = "grid",
+                       classProbs = T)
+
+grid_red = expand.grid(size = 1:10, 
+                        dropout = c(0.1,0.25,0.5), 
+                        batch_size = 5,
+                        lr = c(1e-3,1e-4,1e-5),
+                        rho = 0,
+                        decay = 0,
+                        activation = c("sigmoid","relu","tanh"))
+
+#model_red <- caret::train(
+  #x = as.matrix(train_x),
+  #y = train_y,
+  #preProcess = NULL,
+  #tuneGrid = grid_red,
+  #trControl = ctrl_red,
+  #method = "mlpKerasDropout",
+  #epochs = 10
+#)
+
+model_red  <- readRDS("model_red.RDS")
+
+model_red
+```
+Estos valores finales fueron seleccionados como los mejores durante el proceso de ajuste de hiperparámetros utilizando la exactitud como métrica de evaluación del rendimiento del modelo.
+
+```{r}
+#get_weights(model_red)
+```
+Con esto intento mirar los pesos de la red y con ello obtener las variables representativas.
+
+
+## Pregunta (1.5 puntos)
+
+¿Aportan el análisis digital, la transcriptómica, o el perfil inmunológico, algo al conjunto de datos `Main.csv` con respecto a la capacidad para predecir respuesta al tratamiento? Describe detalladamente la metodología que vas a usar para responder a la pregunta, ejecuta dicha metodología y analiza los resultados, respondiendo a la pregunta para cada uno de los tres conjuntos por separado.
+
+## Pregunta (2.0 puntos)
+
+¿Qué ocurre si fusionamos todos los conjuntos de datos en uno solo? ¿Existe alguna técnica que reduzca la dimensionalidad del conjunto, aun a riesgo de perder interpretabilidad? Si es así, comprueba si funciona o por el contrario no ganamos nada. ¿Y si queremos mantener la interpretabilidad intacta? ¿Se te ocurre alguna técnica para seleccionar los predictores relevantes? Si es así, evalúala y comenta los resultados.
+
+
+Si fusionamos todos los conjuntos de datos en uno solo tendremos demasiadas variables como para llevar a cabo una buena interpretación, además que tendríamos variables redundantes y para poder decir que el tratamiento es correcto debemos tener conocimiento de estos datos y si es correcto hacerlo ya que a nivel biológico no sabemos si tiene algún sentido.
+
+Una PCA reduciría la dimensionalidad del conjunto, el problema es que al tener demasiadas variables todas ellas tendrán la misma importancia y no podremos discernir unas de otras.
+
+Por otro lado, si quisiesemos mantener la interpretabilidad intacta...
+
+Una técnica que pensé para seleccionar los predictores relevantes fue hacer una regresión logística "Backward" cuyo objetivo es ir quitando variables con respecto a la mejora de los p-values. Perdemos información pero ganamos interpretabilidad.
+
+```{r}
+dc_subset_lm <- cbind(resp.pCr_original,dc_subset)
+
+modelo_inicial_dc <- glm(resp.pCR ~ ., data = dc_subset_lm, family = "binomial")
+
+modelo_final_dc <- step(modelo_inicial_dc, direction = "backward")
+
+#Quitamos las variables que empeoran nuestra regresion
+
+dc_subset_lm_1 <- dc_subset_lm [, -c(7,8,9,11,13,16,17,18,19,21,22,23,24,25,29,30)]
+
+
+glm_dc_p <- glm(resp.pCR ~ ., data=dc_subset_lm_1,family=binomial(link="logit"))
+
+summary(glm_dc_p)
+
+```
+Con esto vemos como los valoress del summary han mejorado drasticamente con respecto al no aplicar este modelo. Este proceso es extrapolable al resto de datasets.
+
+El único problema de hacer esto es que perdemos variables que no sabemos si son importantes o no. Por lo que no deberíamos utilizarla.
+
+
+# Conclusiones de la práctica (1 puntos)
+
+## Pregunta (1 puntos)
+
+Termina la resolución de la práctica elaborando unas conclusiones a dos niveles: el nivel de análisis de datos, ha de comentar qué técnica de preparación de datos ha funcionado mejor en términos de predicción. Luego, el nivel biológico ha de comentar, para el mejor de los experimentos realizados, qué variables han sido las más relevantes. Y se ha de buscar coincidencias y divergencias con los resultados del paper, sobre todo atendiendo a los resultados resumidos en la figura 4 del documento.
+
+
+A nivel de analisis de datos, podemos comprobar como el random forest nos mejora bastante las predicciones haciendolas más precisas y comparado este tratamiento con el de la red neuronal es mucho más sencillo y podemos dejar que la libreria Caret decida que parametros pueden ser los mejores facilitandonos el trabajo. Mientras que la red neuronal requiere mayor delicadeza para afinarla lo suficiente. A la vez que necesita mucho más tiempo de computación. 
+
+A nivel biológico diría que variables tanto **Age.at.diagnosis**, **median_lymph_KDE_knn_50** y **ERBB2.log2.tpm** como **celulas Danaher** son muy importantes en relación a lo que obtenemos en la varible respuesta pCR. Es decir, es importante la edad a la que se realiza el diagnóstico con respecto a encontrar el cáncer.
+
+Con respecto al paper veo que **Age.at.diagnosis** es de gran importancia al igual que en este trabajo, pero las demás variables que aquí damos como relevantes, en el paper no lo son. Esto se puede deber al tratamiento realizadoque no sea del todo correcto.
